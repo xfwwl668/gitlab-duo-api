@@ -1,3 +1,16 @@
+---
+title: gitlab-duo-api
+emoji: 🤖
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
+# GitLab Duo to OpenAI API Proxy
+
+Convert GitLab Duo Chat to OpenAI-compatible API.
+
 # GitLab Duo Chat → OpenAI API Proxy
 
 将 GitLab Duo Chat 转换为 OpenAI 兼容 API，支持多账号池、浏览器辅助登录、流式响应。

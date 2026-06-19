@@ -4,7 +4,7 @@
 server:
   host: "0.0.0.0"
   # 8080 被其他 Docker 服务占用，改用 8088
-  port: 8088
+  port: 7860
   debug: false
 
 gitlab:

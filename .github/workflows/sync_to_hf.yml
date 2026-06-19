@@ -1,0 +1,21 @@
+name: Sync to Hugging Face Hub
+
+on:
+  push:
+    branches: [ main, master ] # 哪个是默认分支就触发哪个
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # 强行用你全新的 GitHub 历史覆盖 Hugging Face
+          git push --force https://wwl168:$HF_TOKEN@huggingface.co/spaces/wwl168/gitlab-duo-api main

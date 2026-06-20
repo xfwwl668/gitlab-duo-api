@@ -138,21 +138,21 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
             else:
                 cfg_dict[section] = values
 
-   cfg_dict.setdefault("pool", {})
+    cfg_dict.setdefault("pool", {})
 
-env_map = {
-    ("server", "host"): "GITLAB_PROXY_HOST",
-    ("server", "port"): "GITLAB_PROXY_PORT",
-    ("gitlab", "auth_type"): "GITLAB_AUTH_TYPE",
-    ("gitlab", "auth_value"): "GITLAB_AUTH_VALUE",
-    ("gitlab", "base_url"): "GITLAB_BASE_URL",
-    ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
-    ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
-
-    # Hugging Face / Docker
-    ("pool", "webui_token"): "WEBUI_TOKEN",
-    ("pool", "strategy"): "POOL_STRATEGY",
-}
+    env_map = {
+        ("server", "host"): "GITLAB_PROXY_HOST",
+        ("server", "port"): "GITLAB_PROXY_PORT",
+        ("gitlab", "auth_type"): "GITLAB_AUTH_TYPE",
+        ("gitlab", "auth_value"): "GITLAB_AUTH_VALUE",
+        ("gitlab", "base_url"): "GITLAB_BASE_URL",
+        ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
+        ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
+    
+        # Hugging Face / Docker
+        ("pool", "webui_token"): "WEBUI_TOKEN",
+        ("pool", "strategy"): "POOL_STRATEGY",
+    }
     for (section, key), env_var in env_map.items():
         val = os.environ.get(env_var)
         if val is not None:

@@ -1098,8 +1098,32 @@ async def startup():
 
 
 @app.get("/", include_in_schema=False)
-async def root_redirect():
-    return RedirectResponse(url="/web", status_code=302)
+async def root():
+    return HTMLResponse(
+        """
+        <!doctype html>
+        <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>GitLab Duo API Proxy</title>
+            <style>
+              body { font-family: system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; padding: 32px; line-height: 1.6; }
+              a { display: inline-block; margin-right: 16px; }
+            </style>
+          </head>
+          <body>
+            <h2>GitLab Duo API Proxy is running.</h2>
+            <p>The service has started successfully on Hugging Face Spaces.</p>
+            <p>
+              <a href="/web">Open WebUI</a>
+              <a href="/health">Health Check</a>
+              <a href="/v1/models">Models</a>
+            </p>
+          </body>
+        </html>
+        """
+    )
 
 
 @app.get("/health")
@@ -1916,7 +1940,7 @@ async def check_update(request: Request):
 async def do_update(request: Request):
     """Git pull + systemctl restart。"""
     await _require_webui(request)
-    import subprocess, os
+    import subprocess
     proj_dir = str(Path(__file__).parent)
     try:
         result = subprocess.run(

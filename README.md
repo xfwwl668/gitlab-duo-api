@@ -1,9 +1,10 @@
 ---
-title: gitlab-duo-api
-emoji: 🤖
+title: GitLab Duo API Proxy
+emoji: 🚀
 colorFrom: blue
-colorTo: red
+colorTo: gray
 sdk: docker
+app_port: 7860
 pinned: false
 ---
 

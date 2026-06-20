@@ -1024,6 +1024,25 @@ async def startup():
     dm = DataManager(db)
     logging.info("[db] SQLite initialized at %s", DB_PATH)
 
+    # Create initial admin from environment variables
+    initial_admin_username = os.environ.get("INITIAL_ADMIN_USERNAME", "").strip()
+    initial_admin_password = os.environ.get("INITIAL_ADMIN_PASSWORD", "").strip()
+
+    if initial_admin_username and initial_admin_password:
+        if len(initial_admin_password) < 6:
+            logging.warning("[db] INITIAL_ADMIN_PASSWORD too short; skipped")
+        else:
+            existing_admin = dm.get_user_by_username(initial_admin_username)
+            if existing_admin:
+                if existing_admin.get("role") != "admin":
+                    dm.update_user_role(existing_admin["id"], "admin")
+                    logging.info("[db] promoted initial admin user: %s", initial_admin_username)
+            else:
+                dm.create_user(initial_admin_username, initial_admin_password, role="admin")
+                logging.info("[db] initial admin user created: %s", initial_admin_username)
+
+# Ensure at least one admin exists
+    
     # Ensure at least one admin exists
     if not dm.has_admin():
         first = dm.get_first_user()

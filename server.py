@@ -138,6 +138,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
             else:
                 cfg_dict[section] = values
 
+    cfg_dict.setdefault("pool", {})
+
     env_map = {
         ("server", "host"): "GITLAB_PROXY_HOST",
         ("server", "port"): "GITLAB_PROXY_PORT",
@@ -146,6 +148,10 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         ("gitlab", "base_url"): "GITLAB_BASE_URL",
         ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
         ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
+
+        # Hugging Face / Docker
+        ("pool", "webui_token"): "WEBUI_TOKEN",
+        ("pool", "strategy"): "POOL_STRATEGY",
     }
     for (section, key), env_var in env_map.items():
         val = os.environ.get(env_var)
@@ -965,15 +971,19 @@ _user_pools: Dict[str, AccountPool] = {}
 _user_pools_lock = asyncio.Lock()
 
 # Storage
-POOL_STORAGE_PATH = Path(__file__).parent / "accounts.json"
-API_KEYS_STORAGE_PATH = Path(__file__).parent / "api_keys.json"
-DB_PATH = Path(__file__).parent / "data" / "duo.db"
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+POOL_STORAGE_PATH = DATA_DIR / "accounts.json"
+API_KEYS_STORAGE_PATH = DATA_DIR / "api_keys.json"
+DB_PATH = DATA_DIR / "duo.db"
 WEB_DIR = Path(__file__).parent / "web"
 
 
 @app.on_event("startup")
 async def startup():
     global config, client, pool, login_mgr, api_key_mgr, dm, db
+
     config = load_config()
 
     # Auto-fetch CSRF token if not provided
@@ -1014,6 +1024,33 @@ async def startup():
     dm = DataManager(db)
     logging.info("[db] SQLite initialized at %s", DB_PATH)
 
+    # Create or update initial admin from Hugging Face Secrets.
+    # This avoids SMTP verification issues on hosts that block outbound SMTP.
+    initial_admin_username = os.environ.get("INITIAL_ADMIN_USERNAME", "").strip()
+    initial_admin_password = os.environ.get("INITIAL_ADMIN_PASSWORD", "").strip()
+
+    if initial_admin_username and initial_admin_password:
+        if len(initial_admin_password) < 6:
+            logging.warning("[db] INITIAL_ADMIN_PASSWORD too short; skipped")
+        else:
+            try:
+                existing_admin = dm.get_user_by_username(initial_admin_username)
+                if existing_admin:
+                    if existing_admin.get("role") != "admin":
+                        dm.update_user_role(existing_admin["id"], "admin")
+                        logging.info("[db] promoted initial admin user: %s", initial_admin_username)
+
+                    if hasattr(dm, "reset_user_password"):
+                        dm.reset_user_password(existing_admin["id"], initial_admin_password)
+                        logging.info("[db] reset initial admin password: %s", initial_admin_username)
+                    else:
+                        logging.warning("[db] reset_user_password unavailable; existing admin password unchanged")
+                else:
+                    dm.create_user(initial_admin_username, initial_admin_password, role="admin")
+                    logging.info("[db] initial admin user created: %s", initial_admin_username)
+            except Exception as e:
+                logging.exception("[db] failed to create/update initial admin: %s", e)
+
     # Ensure at least one admin exists
     if not dm.has_admin():
         first = dm.get_first_user()
@@ -1022,11 +1059,16 @@ async def startup():
             logging.info("[db] promoted first user '%s' to admin", first["username"])
 
     # 记录当前 commit（用于更新检测）
-    import subprocess, os
+    import subprocess
+
     try:
-        r = subprocess.run(["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
-                          capture_output=True, text=True, timeout=10,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        r = subprocess.run(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
         if r.returncode == 0:
             _save_local_commit(r.stdout.strip())
             logging.info("[update] local commit: %s", r.stdout.strip()[:12])
@@ -1048,9 +1090,16 @@ async def startup():
     logging.info(f"  Base URL: {config.gitlab_base_url}")
     logging.info(f"  Models:    {', '.join(config.models.keys())}")
     pool_cfg = await pool.get_config()
-    logging.info(f"  Pool: enabled={config.pool_enabled} strategy={pool_cfg['strategy']} "
-                 f"accounts={pool_cfg['total_accounts']} active={pool_cfg['active_accounts']}")
+    logging.info(
+        f"  Pool: enabled={config.pool_enabled} strategy={pool_cfg['strategy']} "
+        f"accounts={pool_cfg['total_accounts']} active={pool_cfg['active_accounts']}"
+    )
     logging.info("=" * 60)
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url="/web", status_code=302)
 
 
 @app.get("/health")

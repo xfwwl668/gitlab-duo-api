@@ -23,7 +23,10 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from db import DataManager
 
 logger = logging.getLogger("account_pool")
 
@@ -48,8 +51,9 @@ class AccountStats:
 class Account:
     id: str
     name: str
-    auth_type: str                  # cookie | token | session | oauth
+    auth_type: str                  # cookie | pat | token | session | oauth
     auth_value: str
+    cookie_value: str = ""          # PAT 账户可附带 cookie 用于浏览器发送
     enabled: bool = True
     status: str = "active"          # active | cooldown | disabled | invalid
     cooldown_until: float = 0.0     # unix ts
@@ -70,6 +74,12 @@ class Account:
                 d["auth_value"] = v[:8] + "..." + v[-4:]
             else:
                 d["auth_value"] = "***"
+        if mask and d.get("cookie_value"):
+            cv = d["cookie_value"]
+            if len(cv) > 16:
+                d["cookie_value"] = cv[:8] + "..." + cv[-4:]
+            else:
+                d["cookie_value"] = "***"
         return d
 
     def is_available(self, now: float) -> bool:
@@ -99,17 +109,21 @@ class AccountPool:
 
     def __init__(
         self,
-        storage_path: Path,
+        storage_path: Optional[Path] = None,
         strategy: str = "round_robin",
         cooldown_seconds: int = 60,
         max_consecutive_failures: int = 3,
         invalid_on_auth_error: bool = True,
+        data_manager: Optional[DataManager] = None,
+        user_id: Optional[str] = None,
     ):
         self.storage_path = storage_path
         self.strategy = strategy if strategy in SCHEDULE_STRATEGIES else "round_robin"
         self.cooldown_seconds = cooldown_seconds
         self.max_consecutive_failures = max_consecutive_failures
         self.invalid_on_auth_error = invalid_on_auth_error
+        self.data_manager = data_manager
+        self.user_id = user_id
 
         self._accounts: Dict[str, Account] = {}
         self._rr_index = 0
@@ -122,7 +136,9 @@ class AccountPool:
         if self._loaded:
             return
         async with self._lock:
-            if self.storage_path.exists():
+            if self.data_manager and self.user_id:
+                self._accounts = await self.load_from_db()
+            elif self.storage_path and self.storage_path.exists():
                 try:
                     raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
                     for item in raw.get("accounts", []):
@@ -140,11 +156,47 @@ class AccountPool:
                     logger.error("Failed to load accounts: %s", e)
             self._loaded = True
 
+    async def load_from_db(self) -> Dict[str, Account]:
+        """从 SQLite 加载当前用户的账号（DataManager 模式）。"""
+        accounts: Dict[str, Account] = {}
+        if not self.data_manager or not self.user_id:
+            return accounts
+        rows = self.data_manager.get_available_accounts(self.user_id)
+        for row in rows:
+            stats_data = json.loads(row.get("stats") or "{}") or {}
+            acc = Account(
+                id=row["id"],
+                name=row["name"],
+                auth_type=row["auth_type"],
+                auth_value=row["auth_value"],
+                enabled=bool(row["enabled"]),
+                status=row.get("status") or "active",
+                cooldown_until=float(row.get("cooldown_until") or 0),
+                note=row.get("note") or "",
+                created_at=float(row.get("created_at") or time.time()),
+                stats=AccountStats(**stats_data),
+            )
+            acc.in_flight = 0
+            if acc.status == "cooldown" and time.time() >= acc.cooldown_until:
+                acc.status = "active"
+                acc.cooldown_until = 0.0
+            accounts[acc.id] = acc
+        logger.info("Loaded %d accounts for user %s", len(accounts), self.user_id)
+        return accounts
+
     async def save(self) -> None:
         async with self._lock:
-            self._write_unlocked()
+            await self._write_unlocked()
 
-    def _write_unlocked(self) -> None:
+    async def _write_unlocked(self) -> None:
+        if self.data_manager and self.user_id:
+            for acc in self._accounts.values():
+                self.data_manager.update_account_stats(acc.id, asdict(acc.stats), acc.status, acc.enabled)
+            return
+
+        if not self.storage_path:
+            return
+
         data = {
             "strategy": self.strategy,
             "cooldown_seconds": self.cooldown_seconds,
@@ -165,13 +217,14 @@ class AccountPool:
     # ---------------- CRUD ----------------
 
     async def add(self, name: str, auth_type: str, auth_value: str,
-                  note: str = "", enabled: bool = True) -> Account:
+                  note: str = "", enabled: bool = True, cookie_value: str = "") -> Account:
         async with self._lock:
             acc = Account(
                 id=uuid.uuid4().hex[:12],
                 name=name,
                 auth_type=auth_type,
                 auth_value=auth_value,
+                cookie_value=cookie_value,
                 note=note,
                 enabled=enabled,
             )

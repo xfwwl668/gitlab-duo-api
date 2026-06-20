@@ -25,3 +25,7 @@ Thumbs.db
 
 # Test / debug scripts
 *_test.py
+
+# Runtime data
+data/
+.commit_hash

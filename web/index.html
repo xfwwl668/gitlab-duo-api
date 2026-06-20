@@ -316,6 +316,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
         <span>API 密钥</span>
       </button>
+      <button class="nav-item hidden" id="navAdmin" data-view="admin" onclick="switchView('admin')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        <span>管理员</span>
+      </button>
     </nav>
     <div class="nav-spacer"></div>
     <button class="nav-item" onclick="checkUpdate()" id="updateBtn" title="检查 GitHub 更新">
@@ -423,15 +427,8 @@
       </div>
       <div class="content">
         <div class="panel">
-          <div class="panel-head"><h2>服务信息</h2></div>
-          <div class="panel-body" id="svcInfo" style="font-size:13px;line-height:1.9;">
-            <div class="loading-row"><span class="spinner"></span> 加载中…</div>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><h2>服务信息</h2></div>
-          <div class="panel-body" id="svcInfo" style="font-size:13px;line-height:1.9;">
+          <div class="panel-head"><h2>池配置</h2><span id="poolCfgEditHint" class="hint" style="margin:0;"></span></div>
+          <div class="panel-body" id="poolConfig" style="font-size:13px;line-height:1.9;">
             <div class="loading-row"><span class="spinner"></span> 加载中…</div>
           </div>
         </div>
@@ -475,6 +472,44 @@
 <div>  -H "Content-Type: application/json" \</div>
 <div>  -d '{"model":"claude-opus-4.8","messages":[{"role":"user","content":"hello"}]}'</div>
             </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Admin View -->
+    <section id="view-admin" class="hidden">
+      <div class="topbar">
+        <div>
+          <h1>管理员</h1>
+          <div class="topbar-sub">用户管理、系统统计与全局状态</div>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn btn-ghost btn-sm" onclick="loadAdminData()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            刷新
+          </button>
+        </div>
+      </div>
+      <div class="content">
+        <div class="stats-grid" id="adminStats">
+          <div class="stat-card"><div class="stat-label">注册用户</div><div class="stat-value" id="admTotalUsers">0</div></div>
+          <div class="stat-card"><div class="stat-label">账号总数</div><div class="stat-value" id="admTotalAccounts">0</div></div>
+          <div class="stat-card"><div class="stat-label">API 密钥</div><div class="stat-value" id="admTotalKeys">0</div></div>
+          <div class="stat-card accent"><div class="stat-label">全局池账号</div><div class="stat-value" id="admPoolAccounts">0</div><div class="stat-sub" id="admPoolActive">活跃 0</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>用户列表</h2></div>
+          <div id="adminUsersTable" class="panel-body" style="padding:0;">
+            <div class="loading-row"><span class="spinner"></span> 加载中…</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>全局账号池</h2></div>
+          <div id="adminPoolTable" class="panel-body" style="padding:0;">
+            <div class="loading-row"><span class="spinner"></span> 加载中…</div>
           </div>
         </div>
       </div>
@@ -559,6 +594,7 @@ const API = '';  // same origin
 let TOKEN = localStorage.getItem('duo_jwt') || '';
 let ADMIN_TOKEN = 'duo-admin-2026';  // system-level for update check etc
 let currentView = 'accounts';
+let currentUser = null;
 let models = [];
 
 /* ---------- Auth ---------- */
@@ -627,9 +663,13 @@ function logout() { TOKEN = ''; localStorage.removeItem('duo_jwt'); location.rel
 function enterApp() {
   document.getElementById('loginView').classList.add('hidden');
   document.getElementById('appView').classList.remove('hidden');
-  // 显示用户名
+  // 显示用户名并判断管理员
   fetch('/v1/auth/me', {headers:{'Authorization':'Bearer '+TOKEN}}).then(r=>r.json()).then(u=>{
+    currentUser = u;
     if (u.username) document.getElementById('sidebarFooter').textContent = u.username + ' · v2.0';
+    if (u.role === 'admin') {
+      document.getElementById('navAdmin').classList.remove('hidden');
+    }
   }).catch(()=>{});
   switchView('accounts');
 }
@@ -663,6 +703,7 @@ function switchView(v) {
   if (v==='settings') loadSettings();
   if (v==='chat') loadModels();
   if (v==='apikeys') refreshApiKeys();
+  if (v==='admin') loadAdminData();
 }
 
 /* ---------- Accounts ---------- */
@@ -784,11 +825,11 @@ function showModal(title, a, isEdit) {
           </div>
           <div class="field">
             <label>认证方式</label>
-            <select id="f_auth_type" class="select">
-              <option value="cookie" ${a.auth_type==='cookie'?'selected':''}>Cookie (推荐)</option>
+            <select id="f_auth_type" class="select" onchange="onAuthTypeChange()">
+              <option value="cookie" ${a.auth_type==='cookie'?'selected':''}>Cookie (浏览器F12复制)</option>
+              <option value="pat" ${a.auth_type==='pat'?'selected':''}>PAT + Cookie (推荐，更稳定)</option>
               <option value="token" ${a.auth_type==='token'?'selected':''}>Personal Access Token</option>
               <option value="session" ${a.auth_type==='session'?'selected':''}>Session Token</option>
-              <option value="oauth" ${a.auth_type==='oauth'?'selected':''}>OAuth Bearer</option>
             </select>
           </div>
           <div class="field">
@@ -799,8 +840,13 @@ function showModal(title, a, isEdit) {
           </div>
           <div class="field full">
             <label>认证值 <span class="req">*</span> ${isEdit?'<span style="color:var(--text-faint);font-weight:400;">(留空则不修改)</span>':''}</label>
-            <textarea id="f_auth_value" class="input" placeholder="${a.auth_type==='cookie'?'_gitlab_session=xxx; ...':'token 或 session 值'}">${esc(isEdit?'':a.auth_value)}</textarea>
-            <div class="hint">Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制</div>
+            <textarea id="f_auth_value" class="input" placeholder="${a.auth_type==='pat'?'glpat-xxxxxxxxxxxx':'Cookie 或 Token 值'}">${esc(isEdit?'':a.auth_value)}</textarea>
+            <div class="hint" id="hint_auth">${a.auth_type==='pat'?'PAT: GitLab Settings → Access Tokens → 勾选所有权限':'Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制'}</div>
+          </div>
+          <div class="field full" id="field_cookie" style="${a.auth_type==='pat'?'':'display:none'}">
+            <label>浏览器 Cookie <span style="color:var(--text-faint);font-weight:400;">(选填，用于浏览器发送)</span></label>
+            <textarea id="f_cookie_value" class="input" placeholder="_gitlab_session=xxx; cf_clearance=xxx; ...">${esc(isEdit?'':a.cookie_value||'')}</textarea>
+            <div class="hint">PAT 本身无法触发浏览器发送，需附带 Cookie 辅助。浏览器登录后自动填充</div>
           </div>
           <div class="field full">
             <label>备注</label>
@@ -810,12 +856,35 @@ function showModal(title, a, isEdit) {
       </div>
       <div class="modal-foot">
         <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+        <button class="btn btn-ghost" id="verifyAccBtn" onclick="verifyAccount()">验证</button>
         <button class="btn btn-primary" id="saveAccBtn" onclick="saveAccount(${isEdit?'true':'false'}, '${esc(a.id||'')}')">保存</button>
       </div>
     </div></div>`;
 }
 
 function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+function onAuthTypeChange() {
+  const t = document.getElementById('f_auth_type').value;
+  const fc = document.getElementById('field_cookie');
+  if (fc) fc.style.display = t === 'pat' ? '' : 'none';
+  const hint = document.getElementById('hint_auth');
+  if (hint) hint.textContent = t === 'pat' ? 'PAT: GitLab Settings → Access Tokens → 勾选所有权限' : 'Cookie: 浏览器 F12 → Network → 请求头 Cookie 整行复制';
+}
+
+async function verifyAccount() {
+  const btn = document.getElementById('verifyAccBtn');
+  const body = {
+    auth_type: document.getElementById('f_auth_type').value,
+    auth_value: document.getElementById('f_auth_value').value.trim(),
+  };
+  if (!body.auth_value) { toast('请填写认证值','error'); return; }
+  btn.disabled = true; btn.textContent = '验证中…';
+  try {
+    const r = await fetchJson('/v1/user/accounts/verify', {method:'POST', body:JSON.stringify(body)});
+    toast(r.message || r.status, r.status==='ok'?'success':'error');
+  } catch(e) { toast('验证失败: '+(e.message||e),'error'); }
+  finally { btn.disabled = false; btn.textContent = '验证'; }
+}
 
 async function saveAccount(isEdit, id) {
   const btn = document.getElementById('saveAccBtn');
@@ -826,6 +895,7 @@ async function saveAccount(isEdit, id) {
     auth_value: document.getElementById('f_auth_value').value.trim(),
     note: document.getElementById('f_note').value.trim(),
     enabled: document.getElementById('f_enabled').checked,
+    cookie_value: document.getElementById('f_cookie_value')?.value?.trim?.() || '',
   };
   if (!body.name) { toast('请填写名称','error'); btn.disabled=false; btn.textContent='保存'; return; }
   if (!isEdit && !body.auth_value) { toast('请填写认证值','error'); btn.disabled=false; btn.textContent='保存'; return; }
@@ -845,23 +915,55 @@ async function deleteAccount(id, name) {
   catch(e){ toast('删除失败: '+(e.message||e),'error'); }
 }
 
-/* ---------- Chat ---------- */
-  toast('正在测试…','info');
 /* ---------- Settings ---------- */
 async function loadSettings() {
   try {
-    const h = { 'X-WebUI-Token': ADMIN_TOKEN, 'Content-Type': 'application/json' };
-    const r = await fetch('/v1/accounts/info', {headers:h}).then(x=>x.json());
-    document.getElementById('svcInfo').innerHTML = `
-      <div><b>协议版本:</b> ${esc(r.protocol_version||'-')}</div>
-      <div><b>GitLab 地址:</b> ${esc(r.base_url||'-')}</div>
-      <div><b>默认模型:</b> ${esc(r.default_model||'-')}</div>
-      <div><b>可用模型:</b> ${(r.available_models||[]).map(m=>'<span class="tag" style="margin-right:4px;">'+esc(m)+'</span>').join('')}</div>
-      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><b>API 端点:</b><br><code style="font-family:var(--mono);font-size:12px;">POST /v1/chat/completions</code></div>
-      <div style="margin-top:4px;"><b>Responses API:</b><br><code style="font-family:var(--mono);font-size:12px;">POST /v1/responses</code></div>`;
+    const r = await fetchJson('/v1/admin/pool');
+    const cfg = r.config || {};
+    const isAdmin = currentUser && currentUser.role === 'admin';
+    document.getElementById('poolCfgEditHint').textContent = isAdmin ? '管理员可编辑' : '只读（需管理员权限）';
+    const stratMap = {round_robin:'轮询', random:'随机', least_used:'最少使用'};
+    const disabled = isAdmin ? '' : 'disabled';
+    document.getElementById('poolConfig').innerHTML = `
+      <div class="form-grid" style="max-width:640px;">
+        <div class="field">
+          <label>调度策略</label>
+          <select id="s_strategy" class="select" ${disabled}>
+            <option value="round_robin" ${cfg.strategy==='round_robin'?'selected':''}>轮询</option>
+            <option value="random" ${cfg.strategy==='random'?'selected':''}>随机</option>
+            <option value="least_used" ${cfg.strategy==='least_used'?'selected':''}>最少使用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>冷却秒数</label>
+          <input id="s_cooldown" class="input" type="number" min="0" value="${cfg.cooldown_seconds||60}" ${disabled}>
+        </div>
+        <div class="field">
+          <label>连续失败阈值</label>
+          <input id="s_max_failures" class="input" type="number" min="1" value="${cfg.max_consecutive_failures||3}" ${disabled}>
+        </div>
+        <div class="field">
+          <label>认证错误标 invalid</label>
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;padding-top:8px;">
+            <input type="checkbox" id="s_invalid_on_auth" ${cfg.invalid_on_auth_error?'checked':''} ${disabled}> 启用
+          </label>
+        </div>
+        <div class="field full" style="margin-top:4px;">
+          ${isAdmin?`<button class="btn btn-primary" onclick="savePoolConfig()">保存配置</button>`:`<span style="color:var(--text-faint);font-size:12px;">请联系管理员修改全局池配置</span>`}
+        </div>
+      </div>`;
   } catch(e){ toast('加载失败: '+(e.message||e), 'error'); }
 }
-async function saveSettings() { toast('用户级配置通过 API 管理', 'info'); }
+async function savePoolConfig() {
+  const body = {
+    strategy: document.getElementById('s_strategy').value,
+    cooldown_seconds: parseInt(document.getElementById('s_cooldown').value),
+    max_consecutive_failures: parseInt(document.getElementById('s_max_failures').value),
+    invalid_on_auth_error: document.getElementById('s_invalid_on_auth').checked,
+  };
+  try { await fetchJson('/v1/admin/pool/config', {method:'PUT', body:JSON.stringify(body)}); toast('配置已保存','success'); loadSettings(); }
+  catch(e){ toast('保存失败: '+(e.message||e),'error'); }
+}
 
 /* ---------- Chat ---------- */
 async function loadModels() {
@@ -1183,6 +1285,102 @@ async function revokeApiKey(id) {
   if (!confirm('确定要吊销此密钥？吊销后无法恢复，所有使用此密钥的客户端将立即失效。')) return;
   try { await fetchJson('/v1/user/api-keys/'+id, {method:'DELETE'}); toast('已吊销','success'); refreshApiKeys(); }
   catch(e){ toast('吊销失败: '+(e.message||e),'error'); }
+}
+
+/* ---------- Admin ---------- */
+async function loadAdminData() {
+  try {
+    const stats = await fetchJson('/v1/admin/stats');
+    const users = await fetchJson('/v1/admin/users');
+    const pool = await fetchJson('/v1/admin/pool');
+    renderAdminStats(stats);
+    renderAdminUsers(users.users || []);
+    renderAdminPool(pool.accounts || []);
+  } catch(e) { toast('加载管理数据失败: '+(e.message||e), 'error'); }
+}
+
+function renderAdminStats(s) {
+  const st = s.stats || {};
+  document.getElementById('admTotalUsers').textContent = st.total_users || 0;
+  document.getElementById('admTotalAccounts').textContent = st.total_accounts || 0;
+  document.getElementById('admTotalKeys').textContent = st.total_api_keys || 0;
+  const p = s.pool || {};
+  document.getElementById('admPoolAccounts').textContent = p.total_accounts || 0;
+  document.getElementById('admPoolActive').textContent = '活跃 ' + (p.active_accounts || 0);
+}
+
+function renderAdminUsers(users) {
+  const box = document.getElementById('adminUsersTable');
+  if (!users.length) {
+    box.innerHTML = `<div class="empty"><div>暂无注册用户</div></div>`;
+    return;
+  }
+  box.innerHTML = `<table class="table"><thead><tr>
+    <th>用户名</th><th>角色</th><th>账号数</th><th>密钥数</th><th>注册时间</th><th style="text-align:right;">操作</th>
+  </tr></thead><tbody>${users.map(u=>`
+    <tr>
+      <td><span style="font-weight:600;">${esc(u.username)}</span></td>
+      <td>${renderRoleBadge(u.role)}</td>
+      <td>${u.account_count||0}</td>
+      <td>${u.api_key_count||0}</td>
+      <td style="font-size:12px;color:var(--text-muted);">${u.created_at?fmtTs(u.created_at):'—'}</td>
+      <td><div class="row-actions">
+        ${u.role==='user'?`<button class="btn btn-ghost btn-sm" onclick="setUserRole('${u.id}','admin')">设为管理员</button>`:`<button class="btn btn-ghost btn-sm" onclick="setUserRole('${u.id}','user')">取消管理员</button>`}
+        <button class="btn btn-ghost btn-sm" onclick="resetUserPassword('${u.id}','${esc(u.username)}')">重置密码</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.id}','${esc(u.username)}')">删除</button>
+      </div></td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function renderRoleBadge(role) {
+  if (role === 'admin') return '<span class="badge badge-active"><span class="badge-dot"></span>管理员</span>';
+  return '<span class="badge badge-disabled"><span class="badge-dot"></span>用户</span>';
+}
+
+async function setUserRole(uid, role) {
+  try {
+    await fetchJson('/v1/admin/users/'+uid+'/role', {method:'PUT', body:JSON.stringify({role})});
+    toast('角色已更新','success');
+    loadAdminData();
+  } catch(e){ toast('更新失败: '+(e.message||e),'error'); }
+}
+
+async function resetUserPassword(uid, name) {
+  const pass = prompt('为「'+name+'」设置新密码（至少6位）');
+  if (!pass || pass.length < 6) { if(pass) toast('密码至少6位','error'); return; }
+  try {
+    await fetchJson('/v1/admin/users/'+uid+'/reset-password', {method:'POST', body:JSON.stringify({password:pass})});
+    toast('密码已重置','success');
+  } catch(e){ toast('重置失败: '+(e.message||e),'error'); }
+}
+
+async function deleteUser(uid, name) {
+  if (!confirm('确定删除用户「'+name+'」？该用户的所有账号和密钥也会被删除，不可撤销。')) return;
+  try { await fetchJson('/v1/admin/users/'+uid, {method:'DELETE'}); toast('已删除','success'); loadAdminData(); }
+  catch(e){ toast('删除失败: '+(e.message||e),'error'); }
+}
+
+function renderAdminPool(accs) {
+  const box = document.getElementById('adminPoolTable');
+  if (!accs.length) {
+    box.innerHTML = `<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><div>全局账号池为空</div></div>`;
+    return;
+  }
+  box.innerHTML = `<table class="table"><thead><tr>
+    <th>账号</th><th>认证</th><th>状态</th><th>请求/成功/失败</th><th>备注</th><th>创建时间</th>
+  </tr></thead><tbody>${accs.map(a => {
+    const st = a.enabled ? (a.status||'active') : 'disabled';
+    const labels = {active:'活跃', cooldown:'冷却', disabled:'禁用', invalid:'失效'};
+    const stats = a.stats || {};
+    return `<tr>
+      <td><div class="acc-name">${esc(a.name)} <span class="id">${a.id.slice(0,8)}</span></div></td>
+      <td><span class="tag">${esc(a.auth_type)}</span></td>
+      <td><span class="badge badge-${st}"><span class="badge-dot"></span>${labels[st]||st}</span></td>
+      <td style="font-size:12px;"><b>${stats.total_requests||0}</b> / ${stats.success_count||0} / ${stats.failure_count||0}</td>
+      <td style="font-size:12px;color:var(--text-faint);">${esc(a.note||'—')}</td>
+      <td style="font-size:12px;color:var(--text-muted);">${a.created_at?fmtTs(a.created_at):'—'}</td>
+    </tr>`;
+  }).join('')}</tbody></table>`;
 }
 
 /* ---------- 更新检测 ---------- */

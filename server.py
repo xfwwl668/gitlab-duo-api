@@ -36,12 +36,12 @@ import time
 import uuid
 import logging
 import secrets
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional, AsyncGenerator, Dict, List, Any, Callable, Awaitable
 from pathlib import Path
 
 try:
-    from fastapi import FastAPI, Request, HTTPException, Header, Body, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, Request, HTTPException, Header, Body, WebSocket, WebSocketDisconnect, Depends
     from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse, RedirectResponse
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.staticfiles import StaticFiles
@@ -60,7 +60,8 @@ from browser_login import BrowserLoginManager, BrowserLoginSession  # noqa: E402
 from chat_driver import get_driver, close_driver  # noqa: E402
 from api_keys import ApiKeyManager  # noqa: E402
 from db import Database, DataManager, make_jwt, verify_jwt  # noqa: E402
-from email_smtp import send_code, verify_code  # noqa: E402
+import email_smtp  # noqa: E402
+from email_smtp import send_code, verify_code, load_smtp_config  # noqa: E402
 
 
 # ============================================================
@@ -124,8 +125,6 @@ class AppConfig:
     pool_invalid_on_auth_error: bool = True
     # WebUI access token (auto-generated if empty; protects management UI)
     webui_token: str = ""
-    # Allow requests without auth header to use pool (vs require Authorization)
-    allow_anonymous_pool: bool = True
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -179,7 +178,6 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         pool_retry_count=pool.get("retry_count", 3),
         pool_invalid_on_auth_error=pool.get("invalid_on_auth_error", True),
         webui_token=pool.get("webui_token", "") or cfg_dict.get("webui_token", ""),
-        allow_anonymous_pool=pool.get("allow_anonymous", True),
     )
 
 
@@ -280,8 +278,27 @@ class GitLabDuoClientV2:
         self.config = config
         self.base_url = config.gitlab_base_url.rstrip("/")
         self.graphql_url = f"{self.base_url}{config.graphql_endpoint}"
+        self._csrf_cache: Dict[str, str] = {}
 
-    def _build_headers(self, override_auth: Optional[str] = None) -> Dict[str, str]:
+    def _auth_headers(self, auth_value: str) -> Dict[str, str]:
+        """根据配置生成仅包含认证信息的请求头。"""
+        h: Dict[str, str] = {}
+        if self.config.auth_type == "cookie":
+            h["Cookie"] = auth_value
+        elif self.config.auth_type == "token":
+            h["PRIVATE-TOKEN"] = auth_value
+            h["Authorization"] = f"Bearer {auth_value}"
+        elif self.config.auth_type == "session":
+            h["Cookie"] = f"_gitlab_session={auth_value}"
+        elif self.config.auth_type == "oauth":
+            h["Authorization"] = f"Bearer {auth_value}"
+        return h
+
+    def _build_headers(
+        self,
+        override_auth: Optional[str] = None,
+        csrf_token: Optional[str] = None,
+    ) -> Dict[str, str]:
         """构建请求头（包含认证和GitLab特定头）"""
         headers = {
             "Content-Type": "application/json",
@@ -294,27 +311,21 @@ class GitLabDuoClientV2:
         }
 
         # CSRF token
-        if self.config.csrf_token:
-            headers["X-Csrf-Token"] = self.config.csrf_token
+        csrf = csrf_token or self.config.csrf_token
+        if csrf:
+            headers["X-Csrf-Token"] = csrf
 
         # Auth
         auth_value = override_auth or self.config.auth_value
-        if self.config.auth_type == "cookie":
-            headers["Cookie"] = auth_value
-        elif self.config.auth_type == "token":
-            headers["PRIVATE-TOKEN"] = auth_value
-            headers["Authorization"] = f"Bearer {auth_value}"
-        elif self.config.auth_type == "session":
-            headers["Cookie"] = f"_gitlab_session={auth_value}"
-        elif self.config.auth_type == "oauth":
-            headers["Authorization"] = f"Bearer {auth_value}"
+        headers.update(self._auth_headers(auth_value))
 
         return headers
 
-    async def _fetch_csrf_token(self) -> str:
-        """从 GitLab 页面获取 CSRF token"""
+    async def _fetch_csrf_token(self, auth_value: Optional[str] = None) -> str:
+        """从 GitLab 页面获取 CSRF token（支持携带认证信息）。"""
+        headers = self._auth_headers(auth_value or self.config.auth_value)
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            resp = await client.get(f"{self.base_url}/dashboard/home")
+            resp = await client.get(f"{self.base_url}/dashboard/home", headers=headers)
             match = re.search(r'name="csrf-token" content="([^"]+)"', resp.text)
             if match:
                 return match.group(1)
@@ -338,7 +349,18 @@ class GitLabDuoClientV2:
             "variables": variables,
         }
 
+        auth_value = override_auth or self.config.auth_value
         headers = self._build_headers(override_auth)
+
+        # Cookie/session 认证时若缺少 CSRF token，动态获取并缓存
+        if self.config.auth_type in ("cookie", "session") and not headers.get("X-Csrf-Token"):
+            csrf = self._csrf_cache.get(auth_value)
+            if not csrf:
+                csrf = await self._fetch_csrf_token(auth_value)
+                if csrf:
+                    self._csrf_cache[auth_value] = csrf
+            if csrf:
+                headers["X-Csrf-Token"] = csrf
 
         async with httpx.AsyncClient(timeout=self.config.timeout, follow_redirects=True) as client:
             resp = await client.post(self.graphql_url, json=payload, headers=headers)
@@ -470,14 +492,15 @@ class GitLabDuoClientV2:
         prompt: str,
         model_id: str,
         conversation_id: Optional[str] = None,
+        override_auth: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
         发送聊天消息到 GitLab Duo Workflow
-        
+
         尝试多种 mutation 方式以兼容不同版本的 GitLab
         """
-        
+
         # Strategy 1: Try sendDuoChatMessage mutation (preferred for newer GitLab)
         try:
             result = await self._graphql_request(
@@ -490,6 +513,7 @@ class GitLabDuoClientV2:
                         "conversationId": conversation_id,
                     }
                 },
+                override_auth=override_auth,
             )
             data = result.get("data", {}).get("sendDuoChatMessage", {})
             if data.get("workflow"):
@@ -512,6 +536,7 @@ class GitLabDuoClientV2:
                     "modelId": model_id,
                     "conversationId": conversation_id,
                 },
+                override_auth=override_auth,
             )
             data = result.get("data", {}).get("aiAction", {})
             if data.get("requestId"):
@@ -536,6 +561,7 @@ class GitLabDuoClientV2:
                         "modelId": model_id,
                     }
                 },
+                override_auth=override_auth,
             )
             data = result.get("data", {}).get("createDuoWorkflow", {})
             if data.get("workflow"):
@@ -554,10 +580,11 @@ class GitLabDuoClientV2:
         self,
         workflow_id: str,
         last_message_count: int = 0,
+        override_auth: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         轮询工作流检查点，yield 新增的消息
-        
+
         基于 getWorkflowLatestCheckpoint 查询
         """
         round_num = 0
@@ -572,6 +599,7 @@ class GitLabDuoClientV2:
                     operation_name="getWorkflowLatestCheckpoint",
                     query=self.QUERY_GET_WORKFLOW_CHECKPOINT,
                     variables={"workflowId": workflow_id},
+                    override_auth=override_auth,
                 )
                 
                 nodes = (
@@ -702,6 +730,7 @@ class GitLabDuoClientV2:
                 prompt=prompt,
                 model_id=model_id,
                 conversation_id=conversation_id,
+                override_auth=override_auth,
                 **kwargs,
             )
 
@@ -718,7 +747,8 @@ class GitLabDuoClientV2:
                     if not emit_initial_role:
                         yield f"data: {json.dumps(initial_chunk)}\n\n"
                     async for chunk in self._stream_ai_action_response(
-                        request_id, send_result["chat_id"], completion_id, created_ts, model_name
+                        request_id, send_result["chat_id"], completion_id, created_ts, model_name,
+                        override_auth=override_auth,
                     ):
                         yield chunk
                     return
@@ -734,7 +764,7 @@ class GitLabDuoClientV2:
 
             # Step 2: Poll for response
             full_content_parts = []
-            async for event in self.poll_workflow_response(workflow_id):
+            async for event in self.poll_workflow_response(workflow_id, override_auth=override_auth):
                 etype = event.get("type")
 
                 if etype == "message":
@@ -832,8 +862,9 @@ class GitLabDuoClientV2:
             yield "data: [DONE]\n\n"
 
     async def _stream_ai_action_response(
-        self, request_id: str, chat_id: str, 
+        self, request_id: str, chat_id: str,
         completion_id: str, created_ts: int, model_name: str,
+        override_auth: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """Fallback: use subscription-style polling for aiAction responses"""
         # Poll using the subscription query as a regular query
@@ -844,6 +875,7 @@ class GitLabDuoClientV2:
                     operation_name="aiMessageResponse",
                     query=self.SUBSCRIPTION_AI_RESPONSE,
                     variables={"chatId": chat_id, "requestId": request_id},
+                    override_auth=override_auth,
                 )
                 # Subscription via regular POST won't work well, but let's try
                 data = result.get("data", {}).get("aiMessageResponse")
@@ -924,11 +956,13 @@ app.add_middleware(
 
 config: Optional[AppConfig] = None
 client: Optional[GitLabDuoClientV2] = None
-pool: Optional[AccountPool] = None
+pool: Optional[AccountPool] = None  # legacy global pool (admin read-only)
 login_mgr: Optional[BrowserLoginManager] = None
-api_key_mgr: Optional[ApiKeyManager] = None
+api_key_mgr: Optional[ApiKeyManager] = None  # legacy (to be removed)
 dm: Optional[DataManager] = None
 db: Optional[Database] = None
+_user_pools: Dict[str, AccountPool] = {}
+_user_pools_lock = asyncio.Lock()
 
 # Storage
 POOL_STORAGE_PATH = Path(__file__).parent / "accounts.json"
@@ -971,10 +1005,21 @@ async def startup():
     api_key_mgr = ApiKeyManager(API_KEYS_STORAGE_PATH)
     await api_key_mgr.load()
 
+    # Load SMTP config from config.yaml / env
+    load_smtp_config(CONFIG_PATH)
+    logging.info("[smtp] host=%s user=%s", email_smtp.SMTP_HOST, email_smtp.SMTP_USER)
+
     # Initialize multi-user database
     db = Database(DB_PATH)
     dm = DataManager(db)
     logging.info("[db] SQLite initialized at %s", DB_PATH)
+
+    # Ensure at least one admin exists
+    if not dm.has_admin():
+        first = dm.get_first_user()
+        if first:
+            dm.update_user_role(first["id"], "admin")
+            logging.info("[db] promoted first user '%s' to admin", first["username"])
 
     # 记录当前 commit（用于更新检测）
     import subprocess, os
@@ -1013,6 +1058,32 @@ async def health():
     return {"status": "ok", "service": "gitlab-duo-proxy-v2", "version": "2.0.0"}
 
 
+async def get_user_pool(user_id: str) -> Optional[AccountPool]:
+    """获取或创建某用户的账号池（按 user_id 隔离，缓存）。"""
+    if not dm:
+        return None
+    async with _user_pools_lock:
+        p = _user_pools.get(user_id)
+        if p is None:
+            pool_cfg = await pool.get_config() if pool else {}
+            p = AccountPool(
+                data_manager=dm,
+                user_id=user_id,
+                strategy=pool_cfg.get("strategy", "round_robin"),
+                cooldown_seconds=pool_cfg.get("cooldown_seconds", 60),
+                max_consecutive_failures=pool_cfg.get("max_consecutive_failures", 3),
+                invalid_on_auth_error=pool_cfg.get("invalid_on_auth_error", True),
+            )
+            await p.load()
+            _user_pools[user_id] = p
+        return p
+
+
+def invalidate_user_pool(user_id: str) -> None:
+    """用户账号变更后清除缓存，下次请求重新加载。"""
+    _user_pools.pop(user_id, None)
+
+
 @app.get("/v1/models", response_model=ModelListResponse)
 async def list_models():
     models = [
@@ -1030,57 +1101,63 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
     req_auth = None
     is_api_key = False
     api_key_raw = None
+    user_id = None
     if authorization:
         token = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else authorization
         if token.startswith("sk-"):
             is_api_key = True
             api_key_raw = token
+        elif dm:
+            # 尝试识别为当前登录用户的 JWT
+            user = dm.verify_token(token)
+            if user:
+                user_id = user["id"]
+            else:
+                # 否则视为直接的 GitLab 认证凭证
+                req_auth = token
         else:
             req_auth = token
 
-    # API key auth: check legacy pool keys first, then user-level DB keys
+    # API key auth: 使用 SQLite 中的用户级密钥，密钥绑定到用户
     if is_api_key:
-        if api_key_mgr:
-            key_obj = await api_key_mgr.verify(api_key_raw)
-            if key_obj and key_obj.enabled:
-                await api_key_mgr.report_usage(api_key_raw)
-        else:
-            # Check user-level DB key
-            db_key = dm.verify_api_key(api_key_raw) if dm else None
-            if not db_key or not db_key["enabled"]:
-                raise HTTPException(status_code=401, detail="Invalid or revoked API key")
-            dm.report_key_usage(api_key_raw)
-        # Fall through to pool
+        if not dm:
+            raise HTTPException(status_code=503, detail="Database not initialized")
+        db_key = dm.verify_api_key(api_key_raw)
+        if not db_key or not db_key["enabled"]:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        user_id = db_key["user_id"]
+        dm.report_key_usage(api_key_raw)
 
     model = req.model or config.default_model
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created_ts = int(time.time())
 
     # Decide auth source:
-    #   1. Per-request Authorization (non-API-key) → use it directly (backward compatible)
-    #   2. API key or anonymous → pool scheduling with retry
-    #   3. Fallback → config.auth_value (original behavior)
-    use_pool = (
-        config.pool_enabled
-        and pool is not None
-        and not req_auth
-        and (config.allow_anonymous_pool or is_api_key)
+    #   1. Per-request Authorization (non-API-key, non-JWT) → use it directly
+    #   2. API key / JWT 登录用户 → 使用该用户的账号池（按 user_id 隔离）
+    #   3. Anonymous → fallback config.auth_value（若配置了）
+    use_user_pool = bool(
+        user_id and config.pool_enabled and not req_auth
     )
 
-    if use_pool:
-        pool_summary = await pool.get_summary()
-        active_in_pool = (pool_summary.get("by_status", {}) or {}).get("active", 0)
-        if active_in_pool == 0:
-            # No active account in pool → fall back to config auth if available
-            if config.auth_value and config.auth_value.strip() not in ("", "_gitlab_session=YOUR_SESSION_HERE; _gitlab_session_random=..."):
-                use_pool = False
-            else:
-                raise HTTPException(
-                    status_code=503,
-                    detail="账号池中没有可用账号。请先在 WebUI 通过「浏览器登录」或手动添加一个 GitLab 账号。",
-                )
+    if use_user_pool:
+        user_pool = await get_user_pool(user_id)
+        if user_pool is None:
+            use_user_pool = False
+        else:
+            pool_summary = await user_pool.get_summary()
+            active_in_pool = (pool_summary.get("by_status", {}) or {}).get("active", 0)
+            if active_in_pool == 0:
+                # 用户没有可用账号 → 若有全局 fallback auth 则回退
+                if config.auth_value and config.auth_value.strip() not in ("", "_gitlab_session=YOUR_SESSION_HERE; _gitlab_session_random=..."):
+                    use_user_pool = False
+                else:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="您的账号池中没有可用账号。请先在 WebUI 添加一个 GitLab 账号。",
+                    )
 
-    if use_pool:
+    if use_user_pool:
         async def pool_stream():
             tried: List[str] = []
             last_error = "No available account"
@@ -1098,7 +1175,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
             prompt = "\n\n".join(prompt_parts)
 
             for attempt in range(max(1, config.pool_retry_count)):
-                account = await pool.acquire(exclude=tried)
+                account = await user_pool.acquire(exclude=tried)
                 if account is None:
                     break
                 tried.append(account.id)
@@ -1117,12 +1194,13 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                         logging.warning("[Pool] temp session create failed: %s", e)
                         await pool.report_failure(account.id, last_error)
                         continue
-                    # 用账号 cookie 覆盖
+                    # 用账号 cookie 覆盖 (PAT账户用 cookie_value, cookie账户用 auth_value)
                     from urllib.parse import urlparse as _up
                     host = _up(config.gitlab_base_url).hostname
                     domain = "." + ".".join(host.split(".")[-2:])
+                    cookie_src = (account.cookie_value or account.auth_value) if account.auth_type == "pat" else account.auth_value
                     cookies_to_set = []
-                    for pair in account.auth_value.split(";"):
+                    for pair in cookie_src.split(";"):
                         pair = pair.strip()
                         if "=" not in pair: continue
                         n, _, v = pair.partition("=")
@@ -1140,10 +1218,11 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                 try:
                     async for chunk in sess.chat_stream(
                         prompt=prompt, model_name=model,
+                        pat=(account.auth_value if account.auth_type == "pat" else ""),
                     ):
                         streamed_any = True
                         yield chunk
-                    await pool.report_success(account.id)
+                    await user_pool.report_success(account.id)
                     return
                 except Exception as e:
                     last_error = str(e)
@@ -1151,7 +1230,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
                         "[Pool] account '%s' chat failed (attempt %d/%d): %s",
                         account.name, attempt + 1, config.pool_retry_count, e,
                     )
-                    await pool.report_failure(account.id, last_error)
+                    await user_pool.report_failure(account.id, last_error)
                     if streamed_any:
                         yield "data: [DONE]\n\n"
                         return
@@ -1215,7 +1294,7 @@ async def chat_completions(req: ChatCompletionRequest, authorization: Optional[s
     # ---- Non-pool path (per-request auth or config fallback) ----
     active_client = client
     if req_auth:
-        active_client = GitLabDuoClientV2(AppConfig(**asdict(config), auth_value=req_auth))
+        active_client = GitLabDuoClientV2(replace(config, auth_value=req_auth))
 
     if req.stream:
         async def generate():
@@ -1334,6 +1413,18 @@ async def _require_webui(request: Request):
     if not _check_webui_token(request):
         raise HTTPException(status_code=401, detail="Invalid or missing WebUI token")
     return True
+
+
+async def _get_user_or_webui(request: Request) -> Optional[dict]:
+    """从请求中识别调用者：优先 JWT，其次 webui_token（返回 None 表示管理员）。"""
+    auth = request.headers.get("authorization") or ""
+    if auth.startswith("Bearer "):
+        user = dm.verify_token(auth[7:]) if dm else None
+        if user:
+            return user
+    if _check_webui_token(request):
+        return None
+    raise HTTPException(status_code=401, detail="Invalid or missing auth")
 
 
 @app.get("/v1/accounts/pool")
@@ -1497,7 +1588,7 @@ async def pool_get_token(request: Request):
 @app.post("/v1/accounts/pool/assist/create")
 async def assist_create(request: Request):
     """启动一个新的浏览器登录会话，返回 sid。"""
-    await _require_webui(request)
+    await _get_user_or_webui(request)
     if login_mgr is None:
         raise HTTPException(status_code=503, detail="login manager not initialized")
     sid = uuid.uuid4().hex[:12]
@@ -1532,8 +1623,11 @@ async def assist_ws(ws: WebSocket, token: str = ""):
       {type: "logged_in", cookie_preview}
       {type: "error", message}
     """
-    # 鉴权 (query param)
-    if not config or not secrets.compare_digest(token, config.webui_token):
+    # 鉴权 (query param): 优先 JWT，其次 webui_token
+    user = None
+    if token and dm:
+        user = dm.verify_token(token)
+    if user is None and (not config or not secrets.compare_digest(token, config.webui_token)):
         await ws.close(code=4401)
         return
     await ws.accept()
@@ -1542,6 +1636,7 @@ async def assist_ws(ws: WebSocket, token: str = ""):
     sess: Optional[BrowserLoginSession] = None
     push_task: Optional[asyncio.Task] = None
     logged_in_notified = False
+    ws_user_id = user["id"] if user else None
 
     async def on_logged_in(cookie_str: str) -> None:
         nonlocal logged_in_notified
@@ -1635,7 +1730,7 @@ async def assist_ws(ws: WebSocket, token: str = ""):
 @app.post("/v1/accounts/pool/assist/{sid}/save")
 async def assist_save(sid: str, request: Request):
     """从指定登录会话抓取 Cookie 并保存为新账号。"""
-    await _require_webui(request)
+    user = await _get_user_or_webui(request)
     sess = login_mgr.get(sid) if login_mgr else None
     if not sess:
         raise HTTPException(status_code=404, detail="session not found or expired")
@@ -1652,13 +1747,18 @@ async def assist_save(sid: str, request: Request):
     if not cookie_str or "_gitlab_session" not in cookie_str:
         raise HTTPException(status_code=400, detail="no valid gitlab session cookie found")
     note = body.get("note", "").strip() or f"browser login · {sess.current_url}"
-    acc = await pool.add(
-        name=name, auth_type="cookie", auth_value=cookie_str, note=note,
-    )
+    if user:
+        # 保存到当前用户的账号池（API key 调用时可被隔离使用）
+        acc = dm.create_account(user["id"], name, "cookie", cookie_str, note)
+        invalidate_user_pool(user["id"])
+    else:
+        # 兼容旧的全局账号池（管理员 webui_token）
+        acc = await pool.add(name=name, auth_type="cookie", auth_value=cookie_str, note=note)
     # 把已登录会话钉住给该账号聊天用（Cloudflare 已过，复用同一浏览器上下文）
-    login_mgr.pin_for_account(acc.id, sess)
-    logging.info("[assist] session %s pinned for account %s (%s)", sid, acc.id, name)
-    return {"status": "ok", "account": acc.to_dict(mask=True), "pinned": True}
+    acc_id = acc["id"] if isinstance(acc, dict) else acc.id
+    login_mgr.pin_for_account(acc_id, sess)
+    logging.info("[assist] session %s pinned for account %s (%s)", sid, acc_id, name)
+    return {"status": "ok", "account": acc if isinstance(acc, dict) else acc.to_dict(mask=True), "pinned": True}
 
 
 @app.on_event("shutdown")
@@ -1930,7 +2030,12 @@ async def user_accounts_add(request: Request, authorization: Optional[str] = Hea
     auth_value = (body.get("auth_value") or "").strip()
     if not name or not auth_value:
         raise HTTPException(400, "name and auth_value required")
-    acc = dm.create_account(user["id"], name, auth_type, auth_value, body.get("note", ""))
+    cookie_value = (body.get("cookie_value") or "").strip()
+    acc = dm.create_account(user["id"], name, auth_type, auth_value, body.get("note", ""), cookie_value=cookie_value)
+    # 同步保存到账号池 (accounts.json)，供聊天引擎使用
+    if pool and (auth_type in ("cookie", "pat")):
+        await pool.add(name=name, auth_type=auth_type, auth_value=auth_value,
+                       note=body.get("note", ""), cookie_value=cookie_value)
     return {"status": "ok", "account": acc}
 
 
@@ -1947,13 +2052,47 @@ async def user_accounts_update(aid: str, request: Request, authorization: Option
     acc = dm.update_account(aid, **fields)
     if not acc:
         raise HTTPException(404)
+    invalidate_user_pool(user["id"])
     return {"status": "ok", "account": acc}
+
+
+@app.post("/v1/user/accounts/verify")
+async def user_accounts_verify(request: Request, authorization: Optional[str] = Header(None)):
+    """验证 PAT/Cookie 是否有效"""
+    await _get_user_from_auth(authorization)
+    body = await request.json()
+    auth_type = (body.get("auth_type") or "cookie").strip()
+    auth_value = (body.get("auth_value") or "").strip()
+    if not auth_value:
+        raise HTTPException(400, "auth_value required")
+    try:
+        if auth_type == "pat":
+            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+                r = await cl.get(config.gitlab_base_url + "/api/v4/user",
+                                 headers={"PRIVATE-TOKEN": auth_value})
+                if r.status_code == 200:
+                    u = r.json()
+                    return {"status": "ok", "message": f"有效 - {u['username']} (@{u.get('email','')})"}
+                raise HTTPException(400, f"PAT 无效 (HTTP {r.status_code})")
+        else:
+            async with httpx.AsyncClient(timeout=15, verify=False) as cl:
+                r = await cl.get(config.gitlab_base_url + "/api/v4/user",
+                                 headers={"Cookie": auth_value})
+                if r.status_code == 200:
+                    u = r.json()
+                    return {"status": "ok", "message": f"有效 - {u['username']}"}
+                raise HTTPException(400, f"认证失败 (HTTP {r.status_code})")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"验证出错: {e}")
 
 
 @app.delete("/v1/user/accounts/{aid}")
 async def user_accounts_delete(aid: str, authorization: Optional[str] = Header(None)):
-    await _get_user_from_auth(authorization)
+    user = await _get_user_from_auth(authorization)
     dm.delete_account(aid)
+    invalidate_user_pool(user["id"])
     return {"status": "ok", "deleted": aid}
 
 
@@ -1979,6 +2118,103 @@ async def user_apikeys_revoke(kid: str, authorization: Optional[str] = Header(No
     await _get_user_from_auth(authorization)
     dm.revoke_api_key(kid)
     return {"status": "ok", "revoked": kid}
+
+
+# ============================================================
+# Admin endpoints
+# ============================================================
+
+async def _require_admin(authorization: Optional[str] = Header(None)) -> dict:
+    user = await _get_user_from_auth(authorization)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin required")
+    return user
+
+
+@app.get("/v1/admin/stats")
+async def admin_stats(user: dict = Depends(_require_admin)):
+    stats = dm.get_system_stats()
+    pool_cfg = await pool.get_config() if pool else {}
+    pool_summary = await pool.get_summary() if pool else {}
+    return {
+        "status": "ok",
+        "stats": stats,
+        "pool": {**pool_cfg, **pool_summary},
+        "server": {
+            "version": "2.0.0",
+            "host": config.host if config else "",
+            "port": config.port if config else 0,
+            "base_url": config.gitlab_base_url if config else "",
+            "default_model": config.default_model if config else "",
+        },
+    }
+
+
+@app.get("/v1/admin/users")
+async def admin_list_users(user: dict = Depends(_require_admin)):
+    return {"status": "ok", "users": dm.list_all_users()}
+
+
+@app.delete("/v1/admin/users/{uid}")
+async def admin_delete_user(uid: str, user: dict = Depends(_require_admin)):
+    if uid == user["id"]:
+        raise HTTPException(status_code=400, detail="cannot delete yourself")
+    dm.delete_user(uid)
+    return {"status": "ok", "deleted": uid}
+
+
+@app.put("/v1/admin/users/{uid}/role")
+async def admin_set_role(uid: str, request: Request, user: dict = Depends(_require_admin)):
+    if uid == user["id"]:
+        raise HTTPException(status_code=400, detail="cannot change your own role")
+    body = await request.json()
+    role = (body.get("role") or "").strip()
+    if role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="role must be user or admin")
+    if dm.update_user_role(uid, role):
+        return {"status": "ok", "user_id": uid, "role": role}
+    raise HTTPException(status_code=404, detail="user not found")
+
+
+@app.post("/v1/admin/users/{uid}/reset-password")
+async def admin_reset_password(uid: str, request: Request, user: dict = Depends(_require_admin)):
+    body = await request.json()
+    password = (body.get("password") or "").strip()
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="password too short (min 6)")
+    if dm.reset_user_password(uid, password):
+        return {"status": "ok", "user_id": uid, "message": "password reset"}
+    raise HTTPException(status_code=404, detail="user not found")
+
+
+@app.get("/v1/admin/accounts")
+async def admin_list_accounts(user: dict = Depends(_require_admin)):
+    return {"status": "ok", "accounts": dm.list_all_accounts_admin()}
+
+
+@app.get("/v1/admin/api-keys")
+async def admin_list_api_keys(user: dict = Depends(_require_admin)):
+    return {"status": "ok", "keys": dm.list_all_api_keys_admin()}
+
+
+@app.get("/v1/admin/pool")
+async def admin_pool(user: dict = Depends(_require_admin)):
+    return {"status": "ok", "accounts": await pool.list_all(mask=True), "config": await pool.get_config()}
+
+
+@app.put("/v1/admin/pool/config")
+async def admin_pool_config(request: Request, user: dict = Depends(_require_admin)):
+    body = await request.json()
+    await pool.set_config(
+        cooldown_seconds=body.get("cooldown_seconds"),
+        max_consecutive_failures=body.get("max_consecutive_failures"),
+        invalid_on_auth_error=body.get("invalid_on_auth_error"),
+    )
+    if body.get("strategy"):
+        await pool.set_strategy(body["strategy"])
+    # 清掉按用户缓存的池，使新配置对后续请求生效
+    _user_pools.clear()
+    return {"status": "ok", "config": await pool.get_config()}
 
 
 # WebUI (Claude-style)

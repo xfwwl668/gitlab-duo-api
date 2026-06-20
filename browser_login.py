@@ -379,7 +379,8 @@ class BrowserLoginSession:
 
     # ---------------- 聊天驱动 ----------------
     async def chat_stream(
-        self, prompt: str, model_name: str = "claude-opus-4.8", timeout: int = 120
+        self, prompt: str, model_name: str = "claude-opus-4.8", timeout: int = 120,
+        pat: str = "",
     ) -> AsyncGenerator[str, None]:
         """驱动 GitLab Duo Chat UI 发送消息并流式返回 OpenAI SSE。"""
         import httpx
@@ -477,18 +478,23 @@ class BrowserLoginSession:
                 yield "data: [DONE]\n\n"; return
 
             wid = captured_wid[0]
-            cookie_str = await self.get_cookies_str()
-            csrf = ""
-            try:
-                csrf = await self.page.evaluate(
-                    "() => (document.querySelector('meta[name=csrf-token]')||{}).content || ''")
-            except Exception: pass
 
+            # 轮询 headers: 优先用 PAT（更稳定, 不需要 CSRF），否则用 cookie
             query = "query getWorkflowLatestCheckpoint($workflowId: AiDuoWorkflowsWorkflowID!) { duoWorkflowWorkflows(workflowId: $workflowId) { nodes { id status latestCheckpoint { workflowStatus errors duoMessages { content messageType messageId status timestamp __typename } __typename } __typename } __typename } }"
-            headers = {"Content-Type": "application/json", "Accept": "application/json",
-                       "Origin": self.base_url, "Referer": self.base_url + "/dashboard/home",
-                       "X-Gitlab-Feature-Category": "duo_agent_platform", "Cookie": cookie_str}
-            if csrf: headers["X-Csrf-Token"] = csrf
+            if pat:
+                headers = {"PRIVATE-TOKEN": pat, "Content-Type": "application/json",
+                           "X-Gitlab-Feature-Category": "duo_agent_platform"}
+            else:
+                cookie_str = await self.get_cookies_str()
+                csrf = ""
+                try:
+                    csrf = await self.page.evaluate(
+                        "() => (document.querySelector('meta[name=csrf-token]')||{}).content || ''")
+                except Exception: pass
+                headers = {"Content-Type": "application/json", "Accept": "application/json",
+                           "Origin": self.base_url, "Referer": self.base_url + "/dashboard/home",
+                           "X-Gitlab-Feature-Category": "duo_agent_platform", "Cookie": cookie_str}
+                if csrf: headers["X-Csrf-Token"] = csrf
             seen: set = set()
             deadline = time.time() + timeout
             payload = {"operationName": "getWorkflowLatestCheckpoint", "query": query,

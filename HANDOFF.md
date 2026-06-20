@@ -19,8 +19,9 @@
 - 多账号池（轮询/随机/最少使用，失败冷却切换）
 - 浏览器辅助登录（Playwright 串流，自动抓 Cookie）
 - API 密钥管理（`sk-` 格式）
-- 多用户系统（注册/登录/JWT，邮箱验证码）
-- Claude 风格 WebUI
+- 多用户系统（注册/登录/JWT，邮箱验证码，角色：user/admin）
+- 管理员后台（用户管理、角色切换、密码重置、系统统计、全局池监控）
+- Claude 风格 WebUI（管理员入口仅对 admin 角色显示）
 
 ---
 
@@ -62,7 +63,7 @@ gitlab-duo-api/
 ├── config.yaml            # 配置文件
 ├── requirements.txt
 ├── web/
-│   └── index.html         # 单文件前端（登录/注册/账号池/对话/密钥/设置）
+│   └── index.html         # 单文件前端（登录/注册/账号池/对话/密钥/设置/管理员）
 ├── research/              # 协议逆向分析工具（参考用）
 │   ├── capture_api.html
 │   ├── capture_network.js
@@ -156,6 +157,21 @@ browser_login.py: BrowserLoginSession.chat_stream()
 | POST | `/v1/user/api-keys` | 生成密钥（返回原始 key 仅一次） |
 | DELETE | `/v1/user/api-keys/{id}` | 吊销密钥 |
 
+### 管理员资源（需 Bearer JWT 且 role=admin）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/v1/admin/stats` | 系统统计（用户数/账号数/密钥数/全局池状态） |
+| GET | `/v1/admin/users` | 列出所有用户 |
+| DELETE | `/v1/admin/users/{uid}` | 删除用户（不可删除自己） |
+| PUT | `/v1/admin/users/{uid}/role` | 切换用户角色 user/admin |
+| POST | `/v1/admin/users/{uid}/reset-password` | 重置用户密码 |
+| GET | `/v1/admin/accounts` | 查看所有用户账号（跨用户） |
+| GET | `/v1/admin/api-keys` | 查看所有用户密钥（跨用户） |
+| GET | `/v1/admin/pool` | 查看全局账号池 |
+| PUT | `/v1/admin/pool/config` | 修改全局池配置（策略/冷却/阈值） |
+
+> **管理员入口在前端默认隐藏**：`web/index.html` 中 `#navAdmin` 初始 `hidden`，登录后 `/v1/auth/me` 返回 `role=admin` 时才移除隐藏。普通用户看不到管理员菜单，也访问不了 `/v1/admin/*` 接口。
+
 ### OpenAI 兼容（需 Bearer sk-xxx 或匿名）
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -211,7 +227,12 @@ if status in ("COMPLETED", "FINISHED", "FAILED", "ERROR") or \
 - 修改后务必用 brace count 检查：`python -c "..."`（见历史修复记录）
 - Clipboard API 在 HTTP 下为 `undefined`，需 `execCommand` 回退
 
-### 6.6 SQLite 兼容性
+### 6.6 管理员页面前端隐藏设计
+- 侧边栏「管理员」按钮初始带 `hidden` 类，仅当 `/v1/auth/me` 返回 `role=admin` 时才显示
+- 即使普通用户手动构造 `#view-admin` 也无法加载数据，因为 `/v1/admin/*` 接口会鉴权并返回 403
+- 第一个注册的用户会在启动时自动被提升为 admin（若系统中没有 admin）
+
+### 6.7 SQLite 兼容性
 服务器 SQLite 版本较老，不支持 `DEFAULT (unixepoch())`。
 **所有时间戳用 Python `time.time()` 传入，不要用 SQL 函数默认值。**
 
@@ -297,13 +318,14 @@ SMTP_PASS = "SGpCG4bFp7VwKBaA"
 - [x] Playwright 共享 Browser（修复进程泄漏）
 - [x] 聊天响应速度优化（pinned session 复用）
 - [x] 轮询超时修复（INPUT_REQUIRED 状态）
+- [x] 管理员后台（用户管理、系统统计、全局池监控）
+- [x] 管理员入口前端隐藏（按 JWT role 动态显示）
 
 ### 已知问题 / TODO
 - [ ] **数据层统一**：account_pool.py 和 api_keys.py 旧版存储仍在使用，需迁移到 SQLite
 - [ ] **chat_completions 账号选取**：目前走旧版 `pool.acquire()`，应改为从 SQLite 读取用户账号
 - [ ] **用户级账号池调度**：当前所有用户的账号混在全局池里，应按 user_id 隔离
 - [ ] **邮箱配置外置**：email_smtp.py 硬编码了 SMTP 凭据，应迁移到 config.yaml
-- [ ] **前端优化**：设置页已简化但仍残留旧字段引用
 - [ ] **chat_driver.py 清理**：部分功能已被 browser_login.py 取代，可删除
 - [ ] **HTTPS**：当前是 HTTP，Clipboard API 和安全性需要 HTTPS（可用 Caddy 反代）
 - [ ] **API 密钥与用户绑定**：当前 sk- 密钥鉴权后走全局池，应绑定到用户再查用户的账号
@@ -325,6 +347,7 @@ SMTP_PASS = "SGpCG4bFp7VwKBaA"
 | `feat: multi-tenant` | SQLite 多用户系统 |
 | `feat: email verify` | 163 邮箱验证码注册 |
 | `fix: JS brace` | 大括号不平衡导致所有按钮失效 |
+| `feat: admin panel` | 管理员后台 + 前端入口按角色隐藏 |
 
 ---
 
@@ -350,7 +373,7 @@ SMTP_PASS = "SGpCG4bFp7VwKBaA"
 
 | 要做什么 | 看哪个文件 |
 |---------|-----------|
-| 加新 API 端点 | `server.py` |
+| 加新 API 端点 | `server.py`（管理员接口在 Admin endpoints 区块） |
 | 改聊天逻辑 | `browser_login.py` → `chat_stream()` |
 | 改登录流程 | `browser_login.py` → `start()` + `login_via_httpx()` |
 | 改数据库结构 | `db.py` → `SCHEMA` |

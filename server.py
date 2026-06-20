@@ -138,15 +138,21 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
             else:
                 cfg_dict[section] = values
 
-    env_map = {
-        ("server", "host"): "GITLAB_PROXY_HOST",
-        ("server", "port"): "GITLAB_PROXY_PORT",
-        ("gitlab", "auth_type"): "GITLAB_AUTH_TYPE",
-        ("gitlab", "auth_value"): "GITLAB_AUTH_VALUE",
-        ("gitlab", "base_url"): "GITLAB_BASE_URL",
-        ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
-        ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
-    }
+   cfg_dict.setdefault("pool", {})
+
+env_map = {
+    ("server", "host"): "GITLAB_PROXY_HOST",
+    ("server", "port"): "GITLAB_PROXY_PORT",
+    ("gitlab", "auth_type"): "GITLAB_AUTH_TYPE",
+    ("gitlab", "auth_value"): "GITLAB_AUTH_VALUE",
+    ("gitlab", "base_url"): "GITLAB_BASE_URL",
+    ("gitlab", "default_model"): "GITLAB_DEFAULT_MODEL",
+    ("gitlab", "csrf_token"): "GITLAB_CSRF_TOKEN",
+
+    # Hugging Face / Docker
+    ("pool", "webui_token"): "WEBUI_TOKEN",
+    ("pool", "strategy"): "POOL_STRATEGY",
+}
     for (section, key), env_var in env_map.items():
         val = os.environ.get(env_var)
         if val is not None:
@@ -965,9 +971,13 @@ _user_pools: Dict[str, AccountPool] = {}
 _user_pools_lock = asyncio.Lock()
 
 # Storage
-POOL_STORAGE_PATH = Path(__file__).parent / "accounts.json"
-API_KEYS_STORAGE_PATH = Path(__file__).parent / "api_keys.json"
-DB_PATH = Path(__file__).parent / "data" / "duo.db"
+# Storage
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+POOL_STORAGE_PATH = DATA_DIR / "accounts.json"
+API_KEYS_STORAGE_PATH = DATA_DIR / "api_keys.json"
+DB_PATH = DATA_DIR / "duo.db"
 WEB_DIR = Path(__file__).parent / "web"
 
 
